@@ -7,52 +7,78 @@ import time
 import h5py
 import re
 import numpy as np
+import collections
 
 from datetime import datetime, timedelta
 
 ERROR_TIME = 1.5*60
 Recs = {}
-conditions = {}
-actions = {}
+inputs = {}
+outputs = {}
 
 # Conditions for transitions of the State Machine
 # Az and EL non zero speed fault
-conditions['nzsAz'] = epics.PV('gis:az:azns:aznssums.VAL')
-conditions['nzsEl'] = epics.PV('gis:alt:altns:altnssums.VAL')
+inputs['nzsAz'] = epics.PV('gis:az:azns:aznssums.VAL')
+inputs['nzsEl'] = epics.PV('gis:alt:altns:altnssums.VAL')
 # Voltage set-point for Az and El motors
-conditions['voltAz'] = epics.PV('gis:mon:azmon3:azdspdspc.VAL')
-conditions['voltEl'] = epics.PV('gis:mon:altmon3:altdspdspc.VAL')
+inputs['voltAz'] = epics.PV('gis:mon:azmon3:azdspdspc.VAL')
+inputs['voltEl'] = epics.PV('gis:mon:altmon3:altdspdspc.VAL')
 # MCS follow mode state
-conditions['mcsFollow'] = epics.PV('mc:FollowL')
+inputs['mcsFollow'] = epics.PV('mc:FollowL')
 # Az and El drives assert state
-conditions['azDriveCond'] = epics.PV('mc:azDriveCondition')
-conditions['elDriveCond'] = epics.PV('mc:elDriveCondition')
-conditions['azPosErr'] = epics.PV('mc:azPosError')
-conditions['elPosErr'] = epics.PV('mc:elPosError')
-conditions['prevState'] = ''
+inputs['azDriveCond'] = epics.PV('mc:azDriveCondition')
+inputs['elDriveCond'] = epics.PV('mc:elDriveCondition')
+inputs['azPosErr'] = epics.PV('mc:azPosError')
+inputs['elPosErr'] = epics.PV('mc:elPosError')
+inputs['prevState'] = ''
 
 # Actions taken by each state of the State Machine
 # TCS Follow directive
-actions['tcsMCSFollow'] = epics.PV('tcs:mcFollow.A')
+outputs['tcsMCSFollow'] = epics.PV('tcs:mcFollow.A')
 # TCS Apply directives
-actions['tcsApply'] = epics.PV('tcs:apply.DIR')
+outputs['tcsApply'] = epics.PV('tcs:apply.DIR')
 # F1 Reset
-actions['f1Reset'] = epics.PV('gis:tsrs:gisReset.PROC')
+outputs['f1Reset'] = epics.PV('gis:tsrs:gisReset.PROC')
 # MCS E-stop for motors
-actions['eStop'] = epics.PV('mc:azEstop.PROC')
+outputs['eStop'] = epics.PV('mc:azEstop.PROC')
 # Disable MCS ability to go into Follow Mode
-actions['mcsTrackDis'] = epics.PV('mc:followTrackingOn.DISA')
+outputs['mcsTrackDis'] = epics.PV('mc:followTrackingOn.DISA')
 # Assert/Disassert Az and El drives
-actions['azDriveEn'] = epics.PV('mc:azDriveEnable')
-actions['elDriveEn'] = epics.PV('mc:elDriveEnable')
+outputs['azDriveEn'] = epics.PV('mc:azDriveEnable')
+outputs['elDriveEn'] = epics.PV('mc:elDriveEnable')
 
-Recs['condition'] = conditions
-Recs['action'] = actions
+Recs['Input'] = inputs
+Recs['Output'] = outputs
 
 class InitializationError(Exception):
     def __init__(self, message):
         super().__init__()
         self.message = 'InitializationError: ' + message
+
+class State:
+    def __init__(self, name, handler, transtbl):
+        self.name = name
+        self.handler = handler
+        self.transitions = transtbl
+
+    def run_handler(self, iod):
+        outp = iod['Output']
+        self.handler(outp)
+
+    def run_transitions(self, iod):
+        waitTime = 0
+        inpt = iod['Input']
+        tt = self.transitions
+        startTime = datetime.now()
+        while True:
+            for ns in tt:
+                if ns['cond'](ns['inp'],inpt):
+                    nextState = ns
+                    break
+            waitTime = (datetime.now() - startTime).total_seconds()
+            if not(tt[nextState]['error']) or waitTime > ERROR_TIME:
+                break
+        return nextState
 
 class StateMachine:
     def __init__(self):
@@ -83,7 +109,7 @@ class StateMachine:
         self.prevState = self.startState
         while True:
             (newState, records) = handler(records)
-            records['condition']['prevState'] = self.prevState
+            records['Input']['prevState'] = self.prevState
             self.prevState = newState
             handler = self.handlers[newState.upper()]
             if newState.upper() in self.endStates:
@@ -93,14 +119,20 @@ class StateMachine:
             else:
                 print("Recovery in {0} state".format(newState.upper()))
 
-def start_transitions(recs):
+def transHandler(ttable):
+    for nst in ttable:
+        if ttable[nst]['c'](ttable[nst]['i']):
+            return nst
+    return False
+
+def start_state(recs):
     print('Initiating Non Zero Speed Fault Recovery')
-    cond = recs['condition']
-    if cond['nzsAz'].value or cond['nzsEl'].value:
-        if cond['mcsFollow'].value:
+    inp = recs['Input']
+    if inp['nzsAz'].value or inp['nzsEl'].value:
+        if inp['mcsFollow'].value:
             #Go to FOLLOW_OFF
             newState = 'follow_off'
-        elif (abs(cond['voltAz'].value) > 0.5) or (abs(cond['voltEl'].value) > 0.5):
+        elif (abs(inp['voltAz'].value) > 0.5) or (abs(inp['voltEl'].value) > 0.5):
             #Go to VOLTAGE_ZERO
             newState = 'voltage_zero'
         else:
@@ -112,45 +144,45 @@ def start_transitions(recs):
 def no_fault_actions(recs):
     print('Non Zero Speed Fault not present, ending sequence')
 
-def follow_off_transitions(recs):
+def follow_off_state(recs):
     waitTime = 0
-    cond = recs['condition']
-    actn = recs['action']
-    actn['tcsMCSFollow'].put('Off')
-    actn['tcsApply'].put(3)
+    inp = recs['Input']
+    out = recs['Output']
+    out['tcsMCSFollow'].put('Off')
+    out['tcsApply'].put(3)
     startTime = datetime.now()
     while True:
-        if not(cond['mcsFollow'].value):
+        if not(inp['mcsFollow'].value):
             break
         elif waitTime > ERROR_TIME:
             print('Error: Unable to disable MCS Tracking')
             newState = 'rec_error'
             return (newState, recs)
         waitTime = (datetime.now() - startTime).total_seconds()
-    if cond['prevState'] == 'follow_on':
+    if inp['prevState'] == 'follow_on':
         newState = 'follow_on'
-    elif (abs(cond['voltAz'].value) > 0.5) or (abs(cond['voltEl'].value) > 0.5):
+    elif (abs(inp['voltAz'].value) > 0.5) or (abs(inp['voltEl'].value) > 0.5):
         newState = 'voltage_zero'
     else:
         newState = 'clear_nzsf'
     return (newState, recs)
 
-def voltage_zero_transitions(recs):
+def voltage_zero_state(recs):
     waitTime = 0
-    cond = recs['condition']
-    actn = recs['action']
-    actn['f1Reset'].put(1)
-    # actn['eStop'].put(1)
+    inp = recs['Input']
+    out = recs['Output']
+    out['f1Reset'].put(1)
+    # out['eStop'].put(1)
     time.sleep(0.2)
-    # actn['eStop'].put(0)
+    # out['eStop'].put(0)
     startTime = datetime.now()
     while True:
-        if (abs(cond['voltAz'].value) < 0.1) and (abs(cond['voltEl'].value) < 0.1):
+        if (abs(inp['voltAz'].value) < 0.1) and (abs(inp['voltEl'].value) < 0.1):
             break
         elif waitTime > ERROR_TIME:
             print('Error: Unable to zero reference voltage')
-            print('Az Volts: {0} - El Volts: {1}'.format(cond['voltAz'].value,
-                                                        cond['voltEl'].value))
+            print('Az Volts: {0} - El Volts: {1}'.format(inp['voltAz'].value,
+                                                        inp['voltEl'].value))
             newState = 'rec_error'
             return (newState, recs)
         waitTime = (datetime.now() - startTime).total_seconds()
@@ -158,14 +190,14 @@ def voltage_zero_transitions(recs):
     time.sleep(1)
     return (newState, recs)
 
-def clear_nzsf_transitions(recs):
+def clear_nzsf_state(recs):
     waitTime = 0
-    cond = recs['condition']
-    actn = recs['action']
-    actn['f1Reset'].put(1)
+    inp = recs['Input']
+    out = recs['Output']
+    out['f1Reset'].put(1)
     startTime = datetime.now()
     while True:
-        if (not(cond['nzsAz'].value) and not(cond['nzsEl'].value)):
+        if (not(inp['nzsAz'].value) and not(inp['nzsEl'].value)):
             break
         elif waitTime > ERROR_TIME:
             print('Error: Unable to clear Non Zero Speed Fault from GIS')
@@ -175,24 +207,24 @@ def clear_nzsf_transitions(recs):
     newState = 'fault_cleared'
     return (newState, recs)
 
-def fault_cleared_transitions(recs):
-    cond = recs['condition']
-    if cond['azDriveCond'].value == 2:
+def fault_cleared_state(recs):
+    inp = recs['Input']
+    if inp['azDriveCond'].value == 2:
         newState = 'az_disassert'
-    elif cond['elDriveCond'].value == 2:
+    elif inp['elDriveCond'].value == 2:
         newState = 'el_disassert'
     else:
         newState = 'disable_tracking'
     return (newState, recs)
 
-def az_disassert_transitions(recs):
+def az_disassert_state(recs):
     waitTime = 0
-    cond = recs['condition']
-    actn = recs['action']
-    actn['azDriveEn'].put(1)
+    inp = recs['Input']
+    out = recs['Output']
+    out['azDriveEn'].put(1)
     startTime = datetime.now()
     while True:
-        if cond['azDriveCond'].value == 1:
+        if inp['azDriveCond'].value == 1:
             break
         elif waitTime > ERROR_TIME:
             print('Error: Azimuth Drive did not disassert')
@@ -202,14 +234,14 @@ def az_disassert_transitions(recs):
     newState = 'el_disassert'
     return (newState, recs)
 
-def el_disassert_transitions(recs):
+def el_disassert_state(recs):
     waitTime = 0
-    cond = recs['condition']
-    actn = recs['action']
-    actn['elDriveEn'].put(1)
+    inp = recs['Input']
+    out = recs['Output']
+    out['elDriveEn'].put(1)
     startTime = datetime.now()
     while True:
-        if cond['elDriveCond'].value == 1:
+        if inp['elDriveCond'].value == 1:
             break
         elif waitTime > ERROR_TIME:
             print('Error: Elevation Drive did not disassert')
@@ -219,20 +251,20 @@ def el_disassert_transitions(recs):
     newState = 'disable_tracking'
     return (newState, recs)
 
-def disable_tracking_transitions(recs):
-    actn = recs['action']
-    actn['mcsTrackDis'].put(1)
+def disable_tracking_state(recs):
+    out = recs['Output']
+    out['mcsTrackDis'].put(1)
     newState = 'az_assert'
     return (newState, recs)
 
-def az_assert_transitions(recs):
+def az_assert_state(recs):
     waitTime = 0
-    cond = recs['condition']
-    actn = recs['action']
-    actn['azDriveEn'].put(2)
+    inp = recs['Input']
+    out = recs['Output']
+    out['azDriveEn'].put(2)
     startTime = datetime.now()
     while True:
-        if cond['azDriveCond'].value == 2:
+        if inp['azDriveCond'].value == 2:
             break
         elif waitTime > ERROR_TIME:
             print('Error: Azimuth Drive did not assert')
@@ -242,20 +274,20 @@ def az_assert_transitions(recs):
     newState = 'enable_tracking'
     return (newState, recs)
 
-def enable_tracking_transitions(recs):
-    actn = recs['action']
-    actn['mcsTrackDis'].put(0)
+def enable_tracking_state(recs):
+    out = recs['Output']
+    out['mcsTrackDis'].put(0)
     newState = 'el_assert'
     return (newState, recs)
 
-def el_assert_transitions(recs):
+def el_assert_state(recs):
     waitTime = 0
-    cond = recs['condition']
-    actn = recs['action']
-    actn['elDriveEn'].put(2)
+    inp = recs['Input']
+    out = recs['Output']
+    out['elDriveEn'].put(2)
     startTime = datetime.now()
     while True:
-        if cond['elDriveCond'].value == 2:
+        if inp['elDriveCond'].value == 2:
             break
         elif waitTime > ERROR_TIME:
             print('Error: Elevation Drive did not assert')
@@ -265,26 +297,26 @@ def el_assert_transitions(recs):
     newState = 'follow_on'
     return (newState, recs)
 
-def follow_on_transitions(recs):
+def follow_on_state(recs):
     waitTime = 0
-    cond = recs['condition']
-    actn = recs['action']
-    actn['tcsMCSFollow'].put('On')
-    actn['tcsApply'].put(3)
+    inp = recs['Input']
+    out = recs['Output']
+    out['tcsMCSFollow'].put('On')
+    out['tcsApply'].put(3)
     startTime = datetime.now()
     while True:
-        if cond['mcsFollow'].value:
+        if inp['mcsFollow'].value:
             break
         elif waitTime > ERROR_TIME:
             print('Error: MCS did not start tracking')
             newState = 'rec_error'
             return (newState, recs)
         waitTime = (datetime.now() - startTime).total_seconds()
-    if (((abs(cond['voltAz'].value) < 0.1)
-         and (abs(cond['azPosErr'].value) > 0.01))
-        or ((abs(cond['voltEl'].value) < 0.1)
-            and (abs(cond['elPosErr'].value) > 0.01))):
-        if cond['prevState'] == 'follow_off':
+    if (((abs(inp['voltAz'].value) < 0.1)
+         and (abs(inp['azPosErr'].value) > 0.01))
+        or ((abs(inp['voltEl'].value) < 0.1)
+            and (abs(inp['elPosErr'].value) > 0.01))):
+        if inp['prevState'] == 'follow_off':
             print('Error: MCS Follow enabled but telescope not tracking')
             newState = 'rec_error'
         else:
@@ -297,24 +329,24 @@ def rec_success_actions(recs):
     print('Non Zero Speed Fault recovery successful')
 
 def rec_error_actions(recs):
-    actn = recs['action']
-    actn['mcsTrackDis'].put(0)
+    out = recs['Output']
+    out['mcsTrackDis'].put(0)
     print('Non Zero Speed Fault recovery ended in error')
 
 if __name__ == '__main__':
     nzsfSM = StateMachine()
-    nzsfSM.add_state('start', start_transitions)
-    nzsfSM.add_state('follow_off', follow_off_transitions)
-    nzsfSM.add_state('voltage_zero', voltage_zero_transitions)
-    nzsfSM.add_state('clear_nzsf', clear_nzsf_transitions)
-    nzsfSM.add_state('fault_cleared', fault_cleared_transitions)
-    nzsfSM.add_state('az_disassert', az_disassert_transitions)
-    nzsfSM.add_state('el_disassert', el_disassert_transitions)
-    nzsfSM.add_state('disable_tracking', disable_tracking_transitions)
-    nzsfSM.add_state('az_assert', az_assert_transitions)
-    nzsfSM.add_state('enable_tracking', enable_tracking_transitions)
-    nzsfSM.add_state('el_assert', el_assert_transitions)
-    nzsfSM.add_state('follow_on', follow_on_transitions)
+    nzsfSM.add_state('start', start_state)
+    nzsfSM.add_state('follow_off', follow_off_state)
+    nzsfSM.add_state('voltage_zero', voltage_zero_state)
+    nzsfSM.add_state('clear_nzsf', clear_nzsf_state)
+    nzsfSM.add_state('fault_cleared', fault_cleared_state)
+    nzsfSM.add_state('az_disassert', az_disassert_state)
+    nzsfSM.add_state('el_disassert', el_disassert_state)
+    nzsfSM.add_state('disable_tracking', disable_tracking_state)
+    nzsfSM.add_state('az_assert', az_assert_state)
+    nzsfSM.add_state('enable_tracking', enable_tracking_state)
+    nzsfSM.add_state('el_assert', el_assert_state)
+    nzsfSM.add_state('follow_on', follow_on_state)
     nzsfSM.add_state('no_fault', no_fault_actions, end_state=True)
     nzsfSM.add_state('rec_error', rec_error_actions, end_state=True)
     nzsfSM.add_state('rec_success', rec_success_actions, end_state=True)
